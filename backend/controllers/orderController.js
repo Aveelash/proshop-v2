@@ -1,43 +1,58 @@
 import asyncHandler from "../middleware/asyncHandler.js";
 import Order from "../models/orderModel.js";
+import Product from "../models/productModel.js";
+import { calcPrices } from "../utils/calcPrices.js";
+import { verifyPayPalPayment, checkIfNewTransaction } from "../utils/paypal.js";
 
 // Create a new order
 // POST /api/orders
 // Private
 const addOrderItems = asyncHandler(async (req, res) => {
-  const {
-    orderItems,
+  const { orderItems, shippingAddress, paymentMethod } = req.body;
+
+  if (!orderItems || orderItems.length === 0) {
+    res.status(400);
+    throw new Error("No order items");
+  }
+
+  const itemsFromDB = await Product.find({
+    _id: { $in: orderItems.map((x) => x._id) },
+  });
+
+  const dbOrderItems = orderItems.map((itemFromClient) => {
+    const matchingItemFromDB = itemsFromDB.find(
+      (itemFromDB) => itemFromDB._id.toString() === itemFromClient._id
+    );
+
+    if (!matchingItemFromDB) {
+      throw new Error(`Product not found: ${itemFromClient._id}`);
+    }
+
+    return {
+      product: itemFromClient._id,
+      name: matchingItemFromDB.name,
+      image: matchingItemFromDB.image,
+      price: matchingItemFromDB.price,
+      qty: Number(itemFromClient.qty),
+    };
+  });
+
+  const { itemsPrice, taxPrice, shippingPrice, totalPrice } =
+    calcPrices(dbOrderItems);
+
+  const order = new Order({
+    orderItems: dbOrderItems,
+    user: req.user._id,
     shippingAddress,
     paymentMethod,
     itemsPrice,
     taxPrice,
     shippingPrice,
     totalPrice,
-  } = req.body;
+  });
 
-  if (orderItems && orderItems.length === 0) {
-    res.status(400);
-    throw new Error("No Order Items");
-  } else {
-    const order = new Order({
-      orderItems: orderItems.map((x) => ({
-        ...x,
-        product: x._id,
-        _id: undefined,
-      })),
-      user: req.user._id,
-      shippingAddress,
-      paymentMethod,
-      itemsPrice,
-      shippingPrice,
-      taxPrice,
-      totalPrice,
-    });
-
-    const createdOrder = await order.save();
-
-    res.status(201).json(createdOrder);
-  }
+  const createdOrder = await order.save();
+  res.status(201).json(createdOrder);
 });
 
 // Get logged in user orders
@@ -69,25 +84,44 @@ const getOrderById = asyncHandler(async (req, res) => {
 // PUT /api/orders/:id/pay
 // Private
 const updateOrderToPaid = asyncHandler(async (req, res) => {
+  const { id: transactionId, status, update_time, payer } = req.body;
+
   const order = await Order.findById(req.params.id);
-
-  if (order) {
-    order.isPaid = true;
-    order.paidAt = Date.now();
-    order.paymentResult = {
-      id: req.body.id,
-      status: req.body.status,
-      update_time: req.body.update_time,
-      email_address: req.body.payer.email_address,
-    };
-
-    const updatedOrder = await order.save();
-
-    res.status9(200).json(updatedOrder);
-  } else {
+  if (!order) {
     res.status(404);
     throw new Error("Order not found");
   }
+
+  const { verified, value } = await verifyPayPalPayment(transactionId);
+
+  if (!verified) {
+    res.status(400);
+    throw new Error("Payment not verified");
+  }
+
+  const isNewTransaction = await checkIfNewTransaction(Order, transactionId);
+  if (!isNewTransaction) {
+    res.status(400);
+    throw new Error("Transaction has already been used");
+  }
+
+  const paidCorrectAmount = order.totalPrice.toString() === value;
+  if (!paidCorrectAmount) {
+    res.status(400);
+    throw new Error("Incorrect amount paid");
+  }
+
+  order.isPaid = true;
+  order.paidAt = Date.now();
+  order.paymentResult = {
+    id: transactionId,
+    status,
+    update_time,
+    email_address: payer?.email_address,
+  };
+
+  const updatedOrder = await order.save();
+  res.json(updatedOrder);
 });
 
 // Update order to delivered
